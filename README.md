@@ -4,7 +4,7 @@
 selectively extracting Riot game content (League of Legends, Valorant, and other
 Riot products). It resolves official release manifests from public catalogs,
 downloads only the chunks it needs from the Riot CDN, and maintains the game's
-`Game.db` in Riot's own format.
+`Game.db` in Riot's own format. (i told deepseek to build a cli ontop of my lib, treat it with a grain of salt)
 
 It is the CLI front-end for the `hexgate` patcher library (package
 `hexgate-v2`); the library owns all manifest, chunk and database handling.
