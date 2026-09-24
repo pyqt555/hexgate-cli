@@ -4,11 +4,11 @@
 selectively extracting Riot game content (League of Legends, Valorant, and other
 Riot products). It resolves official release manifests from public catalogs,
 downloads only the chunks it needs from the Riot CDN, and maintains the game's
-`Game.db` in Riot's own format. 
-(i told deepseek to build a cli ontop of my lib, treat it with a grain of salt)
+`Game.db` in Riot's own format. It is also mostly an Ai created wrapper around my hexgate lib, i didnt test it to throurougly, so treat with the appropriate caution
 
-It is the CLI front-end for the `hexgate` patcher library (package
-`hexgate-v2`); the library owns all manifest, chunk and database handling.
+All work happens locally: `hexgate` talks only to the public Riot catalog,
+`api.hexgate.lol` and CDN endpoints, and keeps its state in the platform
+config/cache directories described below.
 
 - Browse every published manifest from the RiotArchiveProject catalog or the
   low-latency `api.hexgate.lol` index.
@@ -17,30 +17,75 @@ It is the CLI front-end for the `hexgate` patcher library (package
 - Extract selected game files into a normal folder without touching an install.
 - Simulate a migration between two builds before committing to it.
 
-> **Documentation map**
-> - User guide: this file
-> - Implementation internals: [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)
-> - Approved UX/behaviour contract: [`docs/DESIGN.md`](docs/DESIGN.md)
-> - Building and packaging: [`BUILDING.md`](BUILDING.md)
+This guide ships with the release bundle (`hexgate-<version>-<target>.zip` /
+`.tar.gz` archives plus `SHA256SUMS`).
 
-## Getting hexgate
+## Install
 
-Build from source (Rust stable):
+| Platform | Archive | Binary |
+| --- | --- | --- |
+| Windows x64 | `hexgate-<version>-x86_64-pc-windows-msvc.zip` | `hexgate.exe` |
+| Linux x64 (static) | `hexgate-<version>-x86_64-unknown-linux-musl.tar.gz` | `hexgate` |
+| Linux arm64 (static) | `hexgate-<version>-aarch64-unknown-linux-musl.tar.gz` | `hexgate` |
+| macOS arm64 | `hexgate-<version>-aarch64-apple-darwin.tar.gz` | `hexgate` |
+| macOS x64 | `hexgate-<version>-x86_64-apple-darwin.tar.gz` | `hexgate` |
 
-```powershell
-cargo build --release
-./target/release/hexgate --version
+**Windows**
+
+```
+Expand-Archive .\hexgate-<version>-x86_64-pc-windows-msvc.zip -DestinationPath "$env:LOCALAPPDATA\Programs\hexgate"
+$env:Path = "$env:LOCALAPPDATA\Programs\hexgate;$env:Path"   # add permanently via System settings
+hexgate --version
 ```
 
-Release binaries for Windows x64, Linux x64/arm64 (static musl) and macOS
-x64/arm64 are produced locally by `./scripts/build.ps1` (`scripts/build.sh` on
-Linux/macOS). See [`BUILDING.md`](BUILDING.md).
+Windows may show a SmartScreen prompt because the binary is not code-signed;
+choose "More info" and "Run anyway". The build needs the Microsoft Visual C++
+2015-2022 Redistributable (`VCRUNTIME140.dll`); most systems already have it,
+otherwise install it from Microsoft.
 
-To install, copy the binary somewhere on your `PATH`.
+**Linux**
+
+```sh
+tar -xzf hexgate-<version>-x86_64-unknown-linux-musl.tar.gz
+install -m 755 hexgate ~/.local/bin/hexgate     # or /usr/local/bin with sudo
+hexgate --version
+```
+
+The Linux builds are static musl binaries: no glibc or other runtime
+dependencies.
+
+**macOS** (13 or newer)
+
+```sh
+tar -xzf hexgate-<version>-aarch64-apple-darwin.tar.gz
+sudo install -m 755 hexgate /usr/local/bin/hexgate
+hexgate --version
+```
+
+The macOS builds are unsigned, so Gatekeeper may block the first run. Clear the
+quarantine flag once (`xattr -d com.apple.quarantine /usr/local/bin/hexgate`)
+or allow it under System Settings -> Privacy & Security.
+
+**Verify the download** before installing (run from the folder with the
+archives):
+
+```sh
+sha256sum -c SHA256SUMS                 # Linux
+shasum -a 256 -c SHA256SUMS             # macOS
+(Get-FileHash .\hexgate-<version>-x86_64-pc-windows-msvc.zip -Algorithm SHA256).Hash
+# compare with the matching line in SHA256SUMS
+```
+
+`hexgate --help` lists the command groups; `hexgate <group> --help` and
+`hexgate <group> <command> --help` show every flag.
+
+**Uninstall:** delete the binary. State lives in the config and cache paths
+listed under [Configuration and state](#configuration-and-state);
+`hexgate config path` and `hexgate manifest cache path` print them.
 
 ## Quick start
 
-```powershell
+```
 # 1. create the global config (cache directory, default product/source)
 hexgate config init
 
@@ -51,17 +96,23 @@ hexgate manifest sync
 hexgate manifest list --product lol --limit 10
 
 # 4. pin an install named "live" to the newest LoL build
+#    (paths default to ./live and ./live.db; add --root/--db to point elsewhere)
 hexgate manifest resolve --latest --source catalog --append --as live
 
-# 5. install it (prompts; add --yes for non-interactive use)
+# 5. download and install it - a full game download of tens of GiB
+#    (prompts before starting; add --yes for non-interactive use)
 hexgate install latest live
 ```
 
 Later, keep it current:
 
-```powershell
+```
 hexgate install update live
 ```
+
+Already have the game on disk? Jump to `install verify` / `install repair` /
+`install db` in the command reference, or see *Register an install for a manual
+path* under Common tasks.
 
 ## How it works
 
@@ -76,16 +127,27 @@ Sources return manifest **IDs**, not bytes. Any command that needs actual
 manifest data fetches the RMAN blob from the product CDN
 (`https://{product}.secure.dyn.riotcdn.net/...`) into the cache on first use.
 
+The same build is often published as several **artifact types** (for example
+`lol-game-client`, `lol-standalone-client-content` or `league-client`).
+`manifest list` and `resolve` show the type and `--artifact` filters it
+(substring, case-insensitive); `resolve` warns when the picked version exists
+as other artifacts.
+
 An **install** is a named entry in your configuration pointing at a root
-directory, a `Game.db` and a pinned manifest ID. Patching operations take an
-exclusive lock, so two `hexgate` processes cannot operate on the same install at
-once.
+directory, a `Game.db` and a pinned manifest ID. Multiple installs are normal:
+every *other* install with a pinned manifest is offered as a local chunk source
+while patching, so shared data is copied instead of downloaded. Patching
+operations take an exclusive lock, so two `hexgate` processes cannot operate on
+the same install at once.
 
 Configuration is three layers, highest priority first:
 
 1. command-line arguments,
 2. `./hexgate.toml` in the working directory (or `--work-dir`),
 3. the platform-global config file.
+
+`--scope none` changes exist only for the current invocation and are labelled
+`ephemeral` in output and `config list --all`.
 
 ## Global options
 
@@ -121,7 +183,11 @@ hexgate config remove <name> [--yes]     # delete an entry
 ```
 
 `config set` keys: `product`, `root-dir`, `db-path`, `languages`, `manifest`,
-`version`, and `source` (the global default manifest source).
+`version`, and the global `source` and `timestamp` settings. `manifest`
+accepts a selector (literal ID, version prefix, `latest`, `@install`) and, when
+the cached source knows it, stores the matching version too - so a hand-pinned
+entry is not mistaken for a fresh install. An ID the source cache does not know
+is refused unless you pass `--version SS.PP.MINOR` explicitly.
 
 Typical layout:
 
@@ -139,6 +205,7 @@ cache_dir = "C:/hexgate/cache"
 source = "catalog"                 # catalog | api
 product = "lol"
 languages = ["windows", "en_US"]
+timestamp = "datetime"             # datetime | raw | relative
 
 [[installs]]
 name = "live"
@@ -152,7 +219,46 @@ languages = ["windows", "en_US"]
 season = 16
 patch = 9
 minor = 7721032
+
+[[installs]]
+name = "pbe"
+product = "lol"
+root_dir = "C:/Riot Games/League of Legends PBE/Game"
+db_path = "C:/Riot Games/League of Legends PBE/Game.db"
+manifest = "0B7343FB7841F598"
+languages = ["windows", "en_US"]
+
+[installs.version]
+season = 16
+patch = 9
+minor = 7750779
 ```
+
+`version` is a table and must stay last within each `[[installs]]` block. An
+optional `version_text` string holds an opaque source version (for example
+Teamfight Tactics `rls-18.4.0...`); when present it is displayed instead of the
+numeric version, and the numeric `version` is a best-effort form for the
+library - good enough for install/update bookkeeping:
+
+```toml
+[[installs]]
+name = "tft"
+product = "teamfighttactics"
+root_dir = "C:/Riot Games/TFT/Game"
+db_path = "C:/Riot Games/TFT/Game.db"
+manifest = "054222AFD3A58261"
+version_text = "rls-18.4.0.5537496.Set18FullPC.Shipping.live"
+
+[installs.version]
+season = 18
+patch = 4
+minor = 0
+```
+
+`timestamp` controls how human-readable timestamps are rendered: `datetime`
+(default, `YYYY-MM-DD HH:MM:SS UTC`), `raw` (the source's original string when
+present) or `relative` (`6 hours ago`). It applies to every human timestamp
+(list, resolve, ...); `--json` output always carries the raw values.
 
 The cache directory holds:
 
@@ -197,31 +303,40 @@ hexgate manifest list   [--source S] [--product P] [filters] [--limit N] [--sort
 hexgate manifest resolve [--source S] [--product P] [filters] [--id HEX | --latest]
                         [--append [--as NAME]] [--root DIR] [--db FILE] [--languages LIST]
 hexgate manifest fetch  <ID> [--product P] [--force]
-hexgate manifest inspect <ID|path>
-hexgate manifest tree   <ID|path> [filters] [--depth N] [--flat]
+hexgate manifest inspect <ID|path> [--product P]
+hexgate manifest tree   <ID|path> [--product P] [filters] [--depth N] [--flat]
 hexgate manifest cache  path | info | clear [--manifests] [--index]
 ```
 
 - `sync` refreshes the selected source's cache. `catalog` always re-downloads
   the full file; `api` is incremental and `--force` resets its cursor.
 - `list` browses without selecting. On `catalog`, omitting `--product` lists
-  every product.
+  every product. The table shows id, product, version, artifact type,
+  realms/servers, platform, date and size.
 - `resolve` picks exactly one manifest. Without `--id`/`--latest` it opens an
-  interactive picker (a TTY is required). `--append` pins the result onto an
-  install entry: `--as NAME` names it, or without `--as` your single existing
-  install is updated. `--root`, `--db` and `--languages` are stored on the
-  entry; paths default to `<work-dir>/<name>` and `<work-dir>/<name>.db`.
+  interactive picker (a TTY is required). When the same product and version
+  exists as multiple artifact types, the chosen one is shown and a warning
+  names the others (`--artifact` chooses explicitly). `--append` pins the
+  result onto an install entry: `--as NAME` names it, or without `--as` your
+  single existing install is updated. `--root`, `--db` and `--languages` are
+  stored on the entry; paths default to `<work-dir>/<name>` and
+  `<work-dir>/<name>.db`.
 - `fetch` downloads the RMAN blob and prints its path.
 - `inspect` reports sizes, tags, bundles, chunking parameters and file totals.
   The target may also be a local `.manifest` file (parsed as untrusted input;
   only inspect files you trust).
-- `tree` renders the file tree, or a flat list with `--flat`.
+- `tree` renders the file tree, or a flat list with `--flat`; `--depth N` keeps
+  paths of at most `N` segments (`--depth 1` is root files only, `DATA/x` is
+  depth 2).
+- A literal ID is looked up in the source cache so the correct product CDN is
+  used (a Valorant ID fetches from the Valorant CDN); `--product` overrides
+  when the ID is not in the cache.
 
 Source filters (shared by `list`/`resolve`):
 
 | Filter | Applies to |
 | --- | --- |
-| `--version <VERSION>` | exact or dotted prefix |
+| `--version <VERSION>` | exact or dotted prefix; numeric segments ignore leading zeros (`9.8` matches `09.08.00.x`) |
 | `--realm <REALM>` / `--realms` | catalog |
 | `--platform <PLATFORM>` / `--platforms` | both |
 | `--artifact <TYPE>` / `--artifacts` | catalog |
@@ -229,6 +344,15 @@ Source filters (shared by `list`/`resolve`):
 | `--since <DATE>` / `--until <DATE>` | both (`YYYY-MM-DD` or RFC3339) |
 | `--min-size` / `--max-size` | both (suffixes: `KiB`, `MiB`, `GiB`) |
 | `--limit <N>` / `--sort version\|timestamp` | both |
+
+Realm, platform, artifact and server filters are case-insensitive **substring**
+matches (`--realm tmnt` matches `LOLTMNT99`, `--platform win` matches
+`Windows`); comma-separated values are ORed.
+
+File filters (`--path-regex`, `--name-regex`, `--glob`, `--tags`,
+`--untagged`, `--min-size`, `--max-size`) are shared by `manifest tree` and
+`extract`. The glob matches the manifest-relative path, and `*` also matches
+`/` (`DATA/*` covers every depth).
 
 ### `install`
 
@@ -248,7 +372,8 @@ hexgate install db     <name>
 - `latest` creates the entry if needed (upsert) and then runs the install/update
   flow. If the entry is pinned, that pin is the target; `--resolve` ignores the
   pin, resolves `latest` again from the source and re-pins. `--product` defaults
-  to the entry's product or the configured default.
+  to the entry's product or the configured default. A pinned entry whose version
+  is still `0.0.0` (usually hand-pinned) warns that it will run a fresh install.
 - `update` requires an existing entry and targets its pin, or `--to <SEL>`.
   A target that is not newer than the current version still proceeds (the
   library does not enforce version order) but prints a warning.
@@ -279,8 +404,9 @@ hexgate extract (--manifest SEL | --from-install NAME) --dest DIR
 - With no explicit `--files`/`--files-from`/`--all`, a TTY opens the interactive
   picker; otherwise every file matching the filters is selected.
 - `--list` prints the exact planned files (path, size, source: `local` or
-  `network`) without downloading. File IDs for `--files` come from
-  `manifest tree --json`.
+  `network`) without downloading; `--list --json` (and the execution envelope)
+  include the same entries in a `files` array. File IDs for `--files` come from
+  `manifest tree --json` and are `0x`-prefixed hex.
 - Extraction cannot be verified - there is no install database - so the summary
   says so.
 - If requested tags match nothing in the manifest the command fails instead of
@@ -302,12 +428,12 @@ only case where a DB is opened).
 
 **First-time setup with a cache on another drive**
 
-```powershell
+```
 hexgate config init
 # cache_dir is materialized by `config init`; edit it in hexgate.toml, e.g.
 #   cache_dir = "D:/hexgate/cache"
 # or override per invocation:
-hexgate --cache-dir D:\hexgate\cache manifest sync
+hexgate --cache-dir D:/hexgate/cache manifest sync
 # prefer the low-latency LoL index as the default source
 hexgate config set settings source api
 ```
@@ -316,36 +442,36 @@ hexgate config set settings source api
 
 **Find the newest LoL build and pin it**
 
-```powershell
+```
 hexgate manifest list --product lol --limit 5
 hexgate manifest resolve --latest --source catalog --append --as live
 ```
 
 **Pin a specific build or a PBE build**
 
-```powershell
+```
 hexgate manifest resolve --version 16.9 --append --as live
 hexgate manifest resolve --latest --realm PBE1 --append --as pbe
 ```
 
 **Register an install for a manual path, then install it**
 
-```powershell
-hexgate install new live --product lol --root "C:\Riot Games\League of Legends\Game"
-hexgate config set live manifest 1D0BDEC9762D3CC3
+```
+hexgate install new live --product lol --root "C:/Riot Games\League of Legends\Game"
+hexgate config set live manifest 1D0BDEC9762D3CC3   # also sets the version when the source cache knows the ID
 hexgate install latest live
 ```
 
 **Preview an update, then apply it**
 
-```powershell
+```
 hexgate install update live --dry-run
 hexgate install update live --yes
 ```
 
 **Verify and repair**
 
-```powershell
+```
 hexgate install verify live         # repairs what it finds, exit 3 if damage remains
 hexgate install verify live --no-repair
 hexgate install repair live
@@ -354,7 +480,7 @@ hexgate install db live             # rebuild Game.db from the files on disk
 
 **Browse what is inside a build**
 
-```powershell
+```
 hexgate manifest inspect 1D0BDEC9762D3CC3
 hexgate manifest tree 1D0BDEC9762D3CC3 --depth 2
 hexgate manifest tree 1D0BDEC9762D3CC3 --glob "DATA/FINAL/Champions/*" --flat
@@ -364,45 +490,45 @@ hexgate manifest fetch 1D0BDEC9762D3CC3             # download the blob, print i
 
 **Extract selected files**
 
-```powershell
+```
 # list what would be extracted first
-hexgate extract --manifest @live --dest .\dump --name-regex "\.wad\.client$" --tags windows,en_US --list
+hexgate extract --manifest @live --dest ./dump --name-regex "\.wad\.client$" --tags windows,en_US --list
 
 # flags-only extraction (non-interactive)
-hexgate extract --manifest @live --dest .\dump --glob "DATA/FINAL/Champions/Ahri.*" --all --yes
+hexgate extract --manifest @live --dest ./dump --glob "DATA/FINAL/Champions/Ahri.*" --all --yes
 
-# exact file IDs from `manifest tree --json` (hex)
-hexgate extract --manifest @live --dest .\dump --files D4076C6EC6892967 --yes
+# exact file IDs from `manifest tree --json` (0x-prefixed hex)
+hexgate extract --manifest @live --dest ./dump --files 0xD4076C6EC6892967 --yes
 
 # or just open the picker
-hexgate extract --manifest @live --dest .\dump
+hexgate extract --manifest @live --dest ./dump
 ```
 
 **Delta-extract using an existing install as the local source**
 
-```powershell
-hexgate extract --from-install live --dest .\dump --tags en_US --all --yes
+```
+hexgate extract --from-install live --dest ./dump --tags en_US --all --yes
 ```
 
 **Compare two builds before updating**
 
-```powershell
+```
 hexgate diff @live latest --tags windows,en_US
 hexgate diff 12ED9F21C0DA9C90 1D0BDEC9762D3CC3 --from-install live
 ```
 
 **Work fully offline**
 
-```powershell
+```
 hexgate --offline manifest list
 hexgate --offline manifest inspect 1D0BDEC9762D3CC3
-hexgate --offline extract --manifest @live --dest .\dump --all --yes
+hexgate --offline extract --manifest @live --dest ./dump --all --yes
 ```
 
 **Use a project-local install that shadows the global one**
 
-```powershell
-cd D:\test-build
+```
+cd ~/test-build
 hexgate config set live root-dir .\Game --scope local
 hexgate config set live db-path .\Game.db --scope local
 hexgate config list --all
@@ -410,10 +536,10 @@ hexgate config list --all
 
 **Script it with JSON**
 
-```powershell
+```
 hexgate --json manifest list --product lol --limit 10
 hexgate --json install update live --dry-run
-hexgate --json extract --manifest @live --dest .\dump --all --list
+hexgate --json extract --manifest @live --dest ./dump --all --list
 ```
 
 ## Interactive pickers
@@ -425,9 +551,10 @@ explicit selection) open a full-screen picker.
 | Key | Action |
 | --- | --- |
 | `up` / `down`, `page-up` / `page-down`, `home` / `end` | Move the cursor |
-| `space` | Toggle the file/folder (folders cascade to their matching files) |
+| `space` | Toggle the file/folder, or the highlighted tag in the filter bar |
 | `right` / `enter` | Expand a folder |
 | `left` | Collapse a folder, or jump to its parent |
+| `left` / `right` (tags row) | Move between `untagged` (first) and the tags |
 | `a` / `n` / `x` | Select all visible / clear visible / clear all |
 | `/` | Focus the filter bar |
 | `tab` / `shift-tab` | Cycle filter fields |
@@ -486,7 +613,15 @@ codes still apply.
 - **Live `Game.db` files are WAL.** If the game is running, close it (or copy
   `Game.db`, `Game.db-wal` and `Game.db-shm`) before using an install as a local
   source for `--from-install` or as a diff source.
+- **`--latest` is realm-agnostic.** It picks the newest timestamp in the
+  selected source, which is frequently a PBE build. Filter with `--realm`
+  (e.g. `--realm pbe`, `--realm na1`) to target a specific realm.
 - **`api` source is LoL-only.** For other products or historical builds use
   `catalog`.
+- **Teamfight Tactics** manifests can be browsed, fetched, inspected and
+  extracted (`--product teamfighttactics`, or `tft` where accepted), and
+  installs work through the opaque `version_text` field. Version-prefix
+  filtering cannot match `rls-...` strings; use `--realm`, `--artifact` or date
+  filters instead.
 - **Local manifest files** passed to `manifest inspect`/`tree` are parsed with
   an unchecked parser; only inspect files you trust.
